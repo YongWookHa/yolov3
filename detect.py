@@ -21,7 +21,7 @@ def detect(save_txt=False, save_img=False):
     model = Darknet(opt.cfg, img_size)
 
     # Load weights
-    attempt_download(weights)
+    #attempt_download(weights)
     if weights.endswith('.pt'):  # pytorch format
         model.load_state_dict(torch.load(weights, map_location=device)['model'])
     else:  # darknet format
@@ -128,6 +128,92 @@ def detect(save_txt=False, save_img=False):
 
     print('Done. (%.3fs)' % (time.time() - t0))
 
+def init_detect(opt):
+    img_size = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
+    weights, half = opt.weights, opt.half
+
+    # Initialize
+    device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
+
+    # Initialize model
+    model = Darknet(opt.cfg, img_size)
+
+    # Load weights
+    #attempt_download(weights)
+    if weights.endswith('.pt'):  # pytorch format
+        model.load_state_dict(torch.load(weights, map_location=device)['model'])
+    else:  # darknet format
+        _ = load_darknet_weights(model, weights)
+
+    # Fuse Conv2d + BatchNorm2d layers
+    # model.fuse()
+
+    # Eval mode
+    model.to(device).eval()
+
+    # Half precision
+    half = half and device.type != 'cpu'  # half precision only supported on CUDA
+    if half:
+        model.half()
+
+    # Get classes and colors
+    classes = load_classes(parse_data_cfg(opt.data)['names'])
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(classes))]
+
+    return [model, device, classes]
+    
+def load_img(path, img_size, half=False):
+    img0 = cv2.imread(path)  # BGR
+    assert img0 is not None, 'Image Not Found ' + path
+
+    # Padded resize
+    img, *_ = letterbox(img0, new_shape=img_size)
+
+    # Normalize RGB
+    img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
+    img = np.ascontiguousarray(img, dtype=np.float16 if half else np.float32)  # uint8 to fp16/fp32
+    img /= 255.0  # 0 - 255 to 0.0 - 1.0
+
+    return img, img0
+
+def custom_detect(opt, model, device, classes, path):
+    t0 = time.time()
+
+    img, im0 = load_img(path, opt.img_size, opt.half)
+
+    t = time.time()
+
+    # Get detections
+    img = torch.from_numpy(img).to(device)
+    if img.ndimension() == 3:
+        img = img.unsqueeze(0)
+    pred, _ = model(img)
+
+    if opt.half:
+        pred = pred.float()
+
+    boxes = []
+    for i, det in enumerate(non_max_suppression(pred, opt.conf_thres, opt.nms_thres)):  # detections per image
+        p, s = path, ''
+
+        s += '%gx%g ' % img.shape[2:]  # print string
+        if det is not None and len(det):
+            # Rescale boxes from img_size to im0 size
+            det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+            # Print results
+            for c in det[:, -1].unique():
+                n = (det[:, -1] == c).sum()  # detections per class
+                s += '%g %ss, ' % (n, classes[int(c)])  # add to string
+
+            # Write results
+            for *xyxy, conf, _, cls in det:
+                boxes.append([int(x.item()) for x in xyxy] + [int(cls.item())])
+
+        print('%sDone. (%.3fs)' % (s, time.time() - t))
+
+    return boxes
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -143,8 +229,10 @@ if __name__ == '__main__':
     parser.add_argument('--half', action='store_true', help='half precision FP16 inference')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
+    parser.add_argument('--txt', action='store_true', help='save txt file')
+    parser.add_argument('--img', action='store_true', help='save img file')
     opt = parser.parse_args()
     print(opt)
 
     with torch.no_grad():
-        detect()
+        detect(opt.txt, opt.img)
